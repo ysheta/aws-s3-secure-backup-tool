@@ -4,6 +4,7 @@ import io
 from cryptography.fernet import Fernet
 from datetime import datetime
 from dotenv import load_dotenv
+
 # ====================================================
 load_dotenv("keys.env")
 
@@ -14,12 +15,16 @@ REGION         = os.environ.get("REGION")
 
 if not AWS_ACCESS_KEY or not AWS_SECRET_KEY:
     raise ValueError("❌ Missing AWS credentials! Check your keys.env file.")
-
 if not BUCKET_NAME or not REGION:
     raise ValueError("❌ Missing BUCKET_NAME or REGION in keys.env file!")
-# ===================== CONFIG =======================
-FOLDER_TO_BACKUP = os.path.expanduser(os.environ.get("FOLDER_TO_BACKUP"))
-SHARE_EXPIRATION = int(os.environ.get("SHARE_EXPIRATION", 3600))  # 1 hour default
+
+# ====================================================
+_folder_raw = os.environ.get("FOLDER_TO_BACKUP")
+if not _folder_raw:
+    raise ValueError("❌ Missing FOLDER_TO_BACKUP in keys.env file!")
+
+FOLDER_TO_BACKUP = os.path.expanduser(_folder_raw)
+SHARE_EXPIRATION = int(os.environ.get("SHARE_EXPIRATION", 3600))
 # ====================================================
 
 s3 = boto3.client(
@@ -48,27 +53,9 @@ def get_or_create_key():
 key    = get_or_create_key()
 cipher = Fernet(key)
 
-def cleanup_old_share_files():
-    print("🧹 Cleaning up old share files...")
-    try:
-        response = s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix="share/")
-        if 'Contents' not in response:
-            return
-        now = datetime.utcnow()
-        for obj in response['Contents']:
-            last_modified = obj['LastModified'].replace(tzinfo=None)
-            age = (now - last_modified).total_seconds()
-            if age > SHARE_EXPIRATION:
-                s3.delete_object(Bucket=BUCKET_NAME, Key=obj['Key'])
-                print(f"🗑 Deleted old share file: {obj['Key']}")
-    except Exception as e:
-        print(f"⚠️ Cleanup failed: {e}")
-
 def backup_folder():
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     print(f"🚀 Starting backup at {timestamp}...\n")
-
-    cleanup_old_share_files()
 
     success = []
     failed  = []
@@ -85,27 +72,15 @@ def backup_folder():
 
                 encrypted_data = cipher.encrypt(data)
                 file_obj       = io.BytesIO(encrypted_data)
-
                 s3.upload_fileobj(file_obj, BUCKET_NAME, s3_key)
-                print(f"✅ Uploaded: {s3_key}")
+                print(f"✅ Uploaded (encrypted): {s3_key}")
 
-                encrypted_url = s3.generate_presigned_url(
+                presigned_url = s3.generate_presigned_url(
                     'get_object',
                     Params={'Bucket': BUCKET_NAME, 'Key': s3_key},
-                    ExpiresIn=3600
-                )
-                print(f"🔒 Encrypted Link (1 hour):\n{encrypted_url}\n")
-
-                share_key  = f"share/{timestamp}/{relative_path}"
-                share_obj  = io.BytesIO(data)
-                s3.upload_fileobj(share_obj, BUCKET_NAME, share_key)
-
-                decrypted_url = s3.generate_presigned_url(
-                    'get_object',
-                    Params={'Bucket': BUCKET_NAME, 'Key': share_key},
                     ExpiresIn=SHARE_EXPIRATION
                 )
-                print(f"🔓 Decrypted Share Link (1 hour):\n{decrypted_url}\n")
+                print(f"🔒 Download Link ({SHARE_EXPIRATION}s):\n{presigned_url}\n")
 
                 success.append(file_path)
 
