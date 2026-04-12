@@ -4,12 +4,22 @@ import json
 import tempfile
 import threading
 import time
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from datetime import datetime
 from dotenv import load_dotenv
 from tqdm import tqdm
 
+# Optional compression support
+try:
+    import zstandard as zstd
+    ZSTD_AVAILABLE = True
+except ImportError:
+    ZSTD_AVAILABLE = False
+
+# ===================================================
+# Configuration & Environment Variables
 # ===================================================
 load_dotenv("keys.env")
 
@@ -23,17 +33,18 @@ if not AWS_ACCESS_KEY or not AWS_SECRET_KEY:
 if not BUCKET_NAME or not REGION:
     raise ValueError("❌ Missing BUCKET_NAME or REGION in keys.env file!")
 
-# ===================================================
 _folder_raw = os.environ.get("FOLDER_TO_BACKUP")
 if not _folder_raw:
     raise ValueError("❌ Missing FOLDER_TO_BACKUP in keys.env file!")
 
 FOLDER_TO_BACKUP = os.path.expanduser(_folder_raw)
 SHARE_EXPIRATION = int(os.environ.get("SHARE_EXPIRATION", 3600))
-
 MAX_WORKERS = max(1, int(os.environ.get("MAX_WORKERS", "12")))
 MAX_RETRIES = max(0, int(os.environ.get("MAX_RETRIES", "3")))
+CHUNK_SIZE = 64 * 1024 * 1024  # 64MB chunks
+COMPRESSION_LEVEL = max(1, min(22, int(os.environ.get("COMPRESSION_LEVEL", "3"))))
 
+# Progress bar logic
 SHOW_PER_FILE_PROGRESS = os.environ.get("SHOW_PER_FILE_PROGRESS")
 if SHOW_PER_FILE_PROGRESS is None:
     SHOW_PER_FILE_PROGRESS = MAX_WORKERS <= 4
@@ -43,7 +54,48 @@ else:
 if not os.path.exists(FOLDER_TO_BACKUP) or not os.path.isdir(FOLDER_TO_BACKUP):
     raise ValueError(f"❌ Folder not found or is not a directory: {FOLDER_TO_BACKUP}")
 
+if not ZSTD_AVAILABLE:
+    print("⚠️  'zstandard' not installed. Backing up WITHOUT compression. (pip install zstandard)")
+
 # ===================================================
+# Extensions that are already compressed or binary-packed.
+# Compressing these wastes CPU and slightly increases file size.
+# ===================================================
+INCOMPRESSIBLE_EXTENSIONS = {
+    # Video
+    ".mp4", ".mkv", ".mov", ".avi", ".wmv", ".flv", ".webm", ".m4v",
+    ".mpg", ".mpeg", ".3gp", ".hevc", ".ts",
+    # Audio
+    ".mp3", ".aac", ".ogg", ".flac", ".m4a", ".wma", ".opus",
+    # Images
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif",
+    ".bmp", ".tiff", ".tif", ".avif",
+    # Archives & packages
+    ".zip", ".gz", ".bz2", ".xz", ".zst", ".lz4", ".br",
+    ".rar", ".7z", ".tar",
+    ".pkg", ".dmg", ".iso", ".deb", ".rpm", ".apk", ".ipa",
+    # Documents with built-in compression
+    ".pdf", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp",
+    ".epub",
+    # Compiled / binary formats
+    ".exe", ".dll", ".so", ".dylib", ".wasm",
+    ".pyc", ".pyd", ".class",
+}
+
+
+def should_compress(file_path: str, file_size: int) -> bool:
+    """
+    Returns True only when compression is expected to be beneficial:
+      - zstd is available
+      - file is non-empty
+      - file extension is not in the known-incompressible set
+    """
+    if not ZSTD_AVAILABLE or file_size == 0:
+        return False
+    ext = os.path.splitext(file_path)[1].lower()
+    return ext not in INCOMPRESSIBLE_EXTENSIONS
+
+
 s3 = boto3.client(
     's3',
     aws_access_key_id=AWS_ACCESS_KEY,
@@ -56,6 +108,7 @@ s3 = boto3.client(
 )
 
 def get_or_create_key():
+    """Fetches existing AES key or generates a new one for the restore script to use."""
     key_file = "encryption_key.key"
     if os.path.exists(key_file):
         with open(key_file, "rb") as f:
@@ -67,11 +120,10 @@ def get_or_create_key():
         key = os.urandom(32)
         with open(key_file, "wb") as f:
             f.write(key)
-        print("✅ New 32-byte AES-256 encryption key generated and saved.")
+        print("✅ New 32-byte AES-256 encryption key generated and saved to encryption_key.key")
         return key
 
 key = get_or_create_key()
-
 console_lock = threading.Lock()
 
 def make_callback(pbar):
@@ -80,27 +132,61 @@ def make_callback(pbar):
             pbar.update(bytes_transferred)
     return callback
 
-def process_single_file(file_path: str, relative_path: str, s3_key: str):
-    """Encrypt once → retry upload only."""
-    chunk_size = 64 * 1024 * 1024
+# Module-Level Helpers
+class EncryptorWriter:
+    """Pipes data directly into the AES encryptor and out to a file object."""
+    def __init__(self, encryptor, file_obj):
+        self.encryptor = encryptor
+        self.file_obj = file_obj
+
+    def write(self, data):
+        self.file_obj.write(self.encryptor.update(data))
+
+    def flush(self):
+        pass
+
+# Core Processing Logic
+def process_single_file(file_path: str, relative_path: str, s3_key: str) -> dict:
+    """
+    Reads file, hashes it, optionally compresses it, encrypts it, and uploads to S3.
+    """
+    original_size = os.path.getsize(file_path)
+    sha256_hash = hashlib.sha256()
+
+    use_compression = should_compress(file_path, original_size)      # skip compression for already-compressed / binary extensions
 
     try:
         with open(file_path, "rb") as f_in:
             with tempfile.TemporaryFile() as f_enc:
                 if not SHOW_PER_FILE_PROGRESS:
-                    print(f"🔐 Encrypting: {relative_path}")
+                    comp_tag = " (zstd)" if use_compression else ""
+                    print(f"🔐 Processing{comp_tag}: {relative_path}")
 
                 nonce = os.urandom(12)
+                comp_flag = b'\x01' if use_compression else b'\x00'
                 f_enc.write(nonce)
+                f_enc.write(comp_flag)
 
                 cipher = Cipher(algorithms.AES(key), modes.GCM(nonce))
                 encryptor = cipher.encryptor()
+                writer = EncryptorWriter(encryptor, f_enc)
 
-                while True:
-                    chunk = f_in.read(chunk_size)
-                    if not chunk:
-                        break
-                    f_enc.write(encryptor.update(chunk))
+                if use_compression:
+                    cctx = zstd.ZstdCompressor(level=COMPRESSION_LEVEL)
+                    with cctx.stream_writer(writer) as compressor:
+                        while True:
+                            chunk = f_in.read(CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            sha256_hash.update(chunk)
+                            compressor.write(chunk)
+                else:
+                    while True:
+                        chunk = f_in.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        sha256_hash.update(chunk)
+                        writer.write(chunk)
 
                 encryptor.finalize()
                 f_enc.write(encryptor.tag)
@@ -121,7 +207,6 @@ def process_single_file(file_path: str, relative_path: str, s3_key: str):
                                 unit_divisor=1024,
                                 desc=f"↑ {relative_path}",
                                 leave=False,
-                                position=None,
                                 mininterval=0.5
                             ) as pbar:
                                 s3.upload_fileobj(
@@ -138,9 +223,9 @@ def process_single_file(file_path: str, relative_path: str, s3_key: str):
 
                     except Exception as e:
                         if attempt == MAX_RETRIES:
-                            raise RuntimeError(f"Upload failed for {relative_path} after {MAX_RETRIES} retries: {e}") from e
+                            raise RuntimeError(f"Upload failed after {MAX_RETRIES} retries: {e}") from e
                         wait = 2 ** attempt
-                        print(f"⚠️  Attempt {attempt+1}/{MAX_RETRIES+1} failed — retrying in {wait}s...")
+                        print(f"⚠️  Attempt {attempt+1}/{MAX_RETRIES+1} failed — retrying in {wait}s... ({e})")
                         time.sleep(wait)
 
                 presigned_url = s3.generate_presigned_url(
@@ -152,22 +237,28 @@ def process_single_file(file_path: str, relative_path: str, s3_key: str):
                 return {
                     "s3_key": s3_key,
                     "presigned_url": presigned_url,
-                    "original_size_bytes": os.path.getsize(file_path)
+                    "original_size_bytes": original_size,
+                    "encrypted_size_bytes": encrypted_size,
+                    "sha256": sha256_hash.hexdigest(),
+                    "compression": "zstd" if use_compression else "none"
                 }
 
+    except IOError as e:
+        raise RuntimeError(f"File read error for {relative_path}: {e}") from e
     except Exception as e:
-        raise RuntimeError(f"Failed {relative_path}: {e}") from e
+        raise RuntimeError(f"Failed processing {relative_path}: {e}") from e
 
 
+# Main Backup Orchestrator
 def backup_folder():
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     print(f"🚀 Starting PARALLEL backup at {timestamp}... "
-          f"(max {MAX_WORKERS} threads | {MAX_RETRIES} upload retries per file)\n")
+          f"({MAX_WORKERS} threads | {MAX_RETRIES} retries | Zstd: {'Available' if ZSTD_AVAILABLE else 'Unavailable'})\n")
 
     files_to_process = []
-    for root, dirs, files in os.walk(FOLDER_TO_BACKUP, followlinks=False):
-        for file in files:
-            file_path     = os.path.join(root, file)
+    for root, _, filenames in os.walk(FOLDER_TO_BACKUP, followlinks=False):
+        for filename in filenames:
+            file_path     = os.path.join(root, filename)
             relative_path = os.path.relpath(file_path, FOLDER_TO_BACKUP)
             s3_key        = f"backups/{timestamp}/{relative_path}"
             files_to_process.append((file_path, relative_path, s3_key))
@@ -179,7 +270,7 @@ def backup_folder():
     manifest = {
         "backup_timestamp": timestamp,
         "source_folder": FOLDER_TO_BACKUP,
-        "encryption": "AES-256-GCM (12-byte nonce + ciphertext + 16-byte tag)",
+        "encryption": "AES-256-GCM (12-byte nonce + 1-byte comp flag + ciphertext + 16-byte tag)",
         "files": {}
     }
 
@@ -189,7 +280,7 @@ def backup_folder():
             for fp, rp, sk in files_to_process
         }
 
-        with tqdm(total=len(files_to_process), desc="Files completed", unit="file") as pbar:
+        with tqdm(total=len(files_to_process), desc="Total Progress", unit="file") as pbar:
             for future in as_completed(future_to_info):
                 fp, rp = future_to_info[future]
                 try:
@@ -197,7 +288,8 @@ def backup_folder():
                     manifest["files"][rp] = manifest_entry
                     success.append(fp)
                 except Exception as e:
-                    print(f"❌ {e}")
+                    with console_lock:
+                        print(f"❌ {e}")
                     failed.append(fp)
                 pbar.update(1)
 
@@ -222,7 +314,9 @@ def backup_folder():
     print(f"\n--- Backup Complete ---")
     print(f"✅ Succeeded: {len(success)} files")
     print(f"❌ Failed:    {len(failed)} files")
+
     if failed:
+        print("\nFailed files:")
         for f in failed:
             print(f"   - {f}")
 
